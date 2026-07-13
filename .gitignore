@@ -1,0 +1,14 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# Local runtime/session artifacts
+indeed_session/
+.qodo/
+
+# Generated output data
+data/*.json
