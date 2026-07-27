@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# macOS metadata
+.DS_Store
+
 # Virtual environments
 venv/
 .venv/
@@ -12,3 +15,6 @@ indeed_session/
 
 # Generated output data
 data/*.json
+data/
+candidate_response_full.json
+schema_paths.txt
