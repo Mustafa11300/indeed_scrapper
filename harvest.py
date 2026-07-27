@@ -1,17 +1,3 @@
-"""
-Indeed candidate harvester (fast, Next-button paginated).
-
-The Manage-candidates list is server-paginated (Prev / Next, 20 per page).
-Each page load fires a 'FindRCPMatches' GraphQL response that already contains
-name + phone. So we just click Next through every page and catch each response.
-No clicking individual profiles.
-
-Stop condition = the page footer ("Showing A-B of TOTAL"), NOT the API's
-overallMatchCount (that's a different, smaller number).
-
-Dedup is by submission id -> re-running RESUMES automatically.
-Output: data/candidates.json and data/candidates.csv
-"""
 from playwright.sync_api import sync_playwright
 import json
 import csv
@@ -24,9 +10,7 @@ CSV_FILE  = "data/candidates.csv"
 SESSION_DIR = "./indeed_session"
 START_URL = "https://employers.indeed.com/candidates?statusName=All&tab=manage&id=0"
 
-# Indeed caps the match list at 3000 per sort order. To get all ~5300 we harvest
-# BOTH directions and dedup. Since you already have the newest 3000 saved, you
-# can set this to ["oldest"] to skip straight to the missing ones this run.
+
 SORT_PASSES = ["newest", "oldest"]
 
 candidates = {}   # submission_id -> record (ordered)
@@ -53,9 +37,7 @@ def save():
         w.writeheader()
         w.writerows(rows)
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
+
 def parse_response(data):
     root = (data.get("data") or {}).get("findRCPMatches")
     if not root:
@@ -96,9 +78,6 @@ def on_response(response):
     if parse_response(data) > 0:
         save()
 
-# ---------------------------------------------------------------------------
-# Pagination via the Next button + footer
-# ---------------------------------------------------------------------------
 def read_footer(page):
     """Return (start, end, total) from 'Showing A-B of TOTAL', else None."""
     try:
