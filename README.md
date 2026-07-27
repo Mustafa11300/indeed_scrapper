@@ -1,12 +1,12 @@
 # Indeed Scraper
 
-This repository contains two Playwright-based scripts for collecting candidate data from Indeed Employer.
+This repository contains a Playwright-based script for collecting candidate data from Indeed Employer.
 
 ## Quick Start
 
 1. Create and activate a virtual environment.
 2. Install dependencies and Playwright browsers.
-3. Run the scraper you want.
+3. Run the scraper.
 
 ```bash
 python3 -m venv .venv
@@ -15,19 +15,14 @@ pip install -r requirements.txt
 python -m playwright install
 ```
 
-## Scripts
+## Script
 
 - `harvest.py` walks the candidate list, switches sort order, and saves candidate records to `data/candidates.json` and `data/candidates.csv`.
-- `main.py` can resume from saved state and writes extracted candidates to `data/extracted_candidates.json`.
 
-Run either script with Python:
+Run the script with Python:
 
 ```bash
 python harvest.py
-```
-
-```bash
-python main.py
 ```
 
 ## What You Need
@@ -38,15 +33,12 @@ python main.py
 
 ## Behavior
 
-- Both scripts use a persistent browser profile stored in `indeed_session/`.
+- The script uses a persistent browser profile stored in `indeed_session/`.
 - Existing files in `data/` are reused so runs can resume and deduplicate results.
-- `main.py` also stores progress in `data/scrape_state.json`.
 
 ## Output
 
 - `harvest.py` writes `data/candidates.json` and `data/candidates.csv`
-- `main.py` writes `data/extracted_candidates.json`
-- `main.py` writes `data/scrape_state.json` to remember the last completed page
 
 ## Resetting
 
@@ -60,4 +52,3 @@ rm -rf data/* indeed_session/
 
 - If the browser opens to a login screen, sign in and rerun the script.
 - If Playwright complains about missing browser binaries, run `python -m playwright install` again.
-- If the scraper appears to resume unexpectedly, clear `data/scrape_state.json` and the saved output files.
