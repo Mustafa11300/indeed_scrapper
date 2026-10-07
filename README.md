@@ -1,54 +1,262 @@
-# Indeed Scraper
+"""
+Indeed candidate harvester (fast, Next-button paginated).
 
-This repository contains a Playwright-based script for collecting candidate data from Indeed Employer.
+The Manage-candidates list is server-paginated (Prev / Next, 20 per page).
+Each page load fires a 'FindRCPMatches' GraphQL response that already contains
+name + phone. So we just click Next through every page and catch each response.
+No clicking individual profiles.
 
-## Quick Start
+Stop condition = the page footer ("Showing A-B of TOTAL"), NOT the API's
+overallMatchCount (that's a different, smaller number).
 
-1. Create and activate a virtual environment.
-2. Install dependencies and Playwright browsers.
-3. Run the scraper.
+Dedup is by submission id -> re-running RESUMES automatically.
+Output: data/candidates.json and data/candidates.csv
+"""
+from playwright.sync_api import sync_playwright
+import json
+import csv
+import os
+import re
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install
-```
+os.makedirs("data", exist_ok=True)
+JSON_FILE = "data/candidates.json"
+CSV_FILE  = "data/candidates.csv"
+SESSION_DIR = "./indeed_session"
+START_URL = "https://employers.indeed.com/candidates?statusName=All&tab=manage&id=0"
 
-## Script
+# Indeed caps the match list at 3000 per sort order. To get all ~5300 we harvest
+# BOTH directions and dedup. Since you already have the newest 3000 saved, you
+# can set this to ["oldest"] to skip straight to the missing ones this run.
+SORT_PASSES = ["newest", "oldest"]   # full sweep: both directions beat the 3000 cap
 
-- `harvest.py` walks the candidate list, switches sort order, and saves candidate records to `data/candidates.json` and `data/candidates.csv`.
+candidates = {}   # submission_id -> record (ordered)
 
-Run the script with Python:
+def load_existing():
+    if os.path.exists(JSON_FILE):
+        try:
+            with open(JSON_FILE, "r", encoding="utf-8") as f:
+                for rec in json.load(f):
+                    key = rec.get("submission_id") or rec.get("phone")
+                    if key:
+                        candidates[key] = rec
+            print(f"Loaded {len(candidates)} existing candidates (will resume/dedup).")
+        except Exception:
+            pass
 
-```bash
-python harvest.py
-```
+def save():
+    rows = list(candidates.values())
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+    with open(CSV_FILE, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "name", "phone", "location", "job_title", "created", "submission_id"])
+        w.writeheader()
+        w.writerows(rows)
 
-## What You Need
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+def parse_response(data):
+    root = (data.get("data") or {}).get("findRCPMatches")
+    if not root:
+        return 0
+    conn = root.get("matchConnection") or {}
+    added = 0
+    for m in conn.get("matches", []):
+        cs = m.get("candidateSubmission") or {}
+        d = cs.get("data") or {}
+        profile = d.get("profile") or {}
+        name  = (profile.get("name") or {}).get("displayName")
+        phone = (profile.get("contact") or {}).get("phoneNumber")
+        loc   = (profile.get("location") or {}).get("location")
+        job_title = None
+        meta = d.get("metadata") or []
+        if meta:
+            job_title = (meta[0].get("data") or {}).get("jobTitle")
+        sub_id = d.get("submissionUuid") or cs.get("id")
+        if not sub_id or sub_id in candidates:
+            continue
+        candidates[sub_id] = {
+            "name": name or "", "phone": phone or "", "location": loc or "",
+            "job_title": job_title or "", "created": d.get("created") or "",
+            "submission_id": sub_id,
+        }
+        added += 1
+        if phone:
+            print(f"[+] {name} - {phone}")
+    return added
 
-- Python 3.10 or newer is recommended.
-- Google Chrome or Chromium must be available on the machine.
-- The first time you run either script, sign in manually in the browser window that opens.
+def on_response(response):
+    if "graphql" not in response.url or response.status != 200:
+        return
+    try:
+        data = response.json()
+    except Exception:
+        return
+    if parse_response(data) > 0:
+        save()
 
-## Behavior
+# ---------------------------------------------------------------------------
+# Pagination via the Next button + footer
+# ---------------------------------------------------------------------------
+def read_footer(page):
+    """Return (start, end, total) from 'Showing A-B of TOTAL', else None."""
+    try:
+        loc = page.locator("text=/Showing\\s+\\d/i").last
+        if loc.count():
+            t = loc.inner_text()
+            m = re.search(r"Showing\s+([\d,]+)\s*[-\u2013]\s*([\d,]+)\s+of\s+([\d,]+)",
+                          t, re.I)
+            if m:
+                return (int(m.group(1).replace(",", "")),
+                        int(m.group(2).replace(",", "")),
+                        int(m.group(3).replace(",", "")))
+    except Exception:
+        pass
+    return None
 
-- The script uses a persistent browser profile stored in `indeed_session/`.
-- Existing files in `data/` are reused so runs can resume and deduplicate results.
+def open_sort_menu(page):
+    for sel in ("button:has-text('Sort by')", "text=/Sort by/i",
+                "[aria-label*='Sort' i]"):
+        loc = page.locator(sel).last
+        try:
+            if loc.count():
+                loc.click()
+                page.wait_for_timeout(700)
+                return True
+        except Exception:
+            continue
+    return False
 
-## Output
+def set_sort(page, which):
+    """Pick 'newest' or 'oldest first' from the Sort dropdown. Returns True on
+    success. The list reloads to page 1 in the new order."""
+    key = "oldest" if which == "oldest" else "newest"
+    if not open_sort_menu(page):
+        print("  Could not open the Sort menu.")
+        return False
+    for finder in (
+        lambda: page.get_by_role("option", name=re.compile(key, re.I)),
+        lambda: page.get_by_role("menuitemradio", name=re.compile(key, re.I)),
+        lambda: page.get_by_role("menuitem", name=re.compile(key, re.I)),
+        lambda: page.locator(f"[role='option']:has-text('{key}')"),
+        lambda: page.locator(f"li:has-text('{key}')"),
+    ):
+        try:
+            loc = finder()
+            if loc.count():
+                loc.last.click()
+                page.wait_for_timeout(3000)  # list reloads
+                print(f"  Sort set to '{which} first'.")
+                return True
+        except Exception:
+            continue
+    print(f"  Couldn't find the '{key} first' option automatically.")
+    return False
 
-- `harvest.py` writes `data/candidates.json` and `data/candidates.csv`
+def click_next(page):
+    for sel in ("a:has-text('Next')", "button:has-text('Next')",
+                "[aria-label*='Next' i]"):
+        btn = page.locator(sel).last
+        try:
+            if btn.count() and btn.is_visible() and btn.is_enabled():
+                btn.scroll_into_view_if_needed()
+                btn.click()
+                return True
+        except Exception:
+            continue
+    return False
 
-## Resetting
+def ensure_page_one(page, which):
+    """Set the sort order AND make sure we're actually on page 1. Indeed
+    remembers the last pagination position, so re-selecting the same sort may
+    not reset it -- in that case we flip to the other order and back to force
+    a reload from page 1."""
+    set_sort(page, which)
+    foot = read_footer(page)
+    if foot and foot[0] > 1:
+        print(f"  Not on page 1 (at {foot[0]}); forcing a reset...")
+        other = "oldest" if which == "newest" else "newest"
+        set_sort(page, other)
+        set_sort(page, which)
+        foot = read_footer(page)
+        if foot:
+            print(f"  Now at {foot[0]}-{foot[1]}.")
 
-If you want a completely fresh run, delete the saved data and browser session before starting again:
+def harvest_pages(page, max_pages=500):
+    """Page forward until the last page or the 3000 cap (Next disabled).
+    IMPORTANT: we stop on PAGE POSITION, never on 'no new candidates' -- with a
+    saved file, most pages are all-duplicates and that's expected, not the end."""
+    stuck = 0
+    for _ in range(max_pages):
+        foot = read_footer(page)
+        pos = f"page {foot[0]}-{foot[1]} of {foot[2]}" if foot else "(footer unreadable)"
+        print(f"Collected {len(candidates)}  {pos}")
 
-```bash
-rm -rf data/* indeed_session/
-```
+        if foot and foot[1] >= foot[2]:
+            print("  Reached the last page.")
+            break
 
-## Troubleshooting
+        prev_end = foot[1] if foot else None
+        if not click_next(page):
+            print("  Next disabled -> hit the 3000 cap for this sort order.")
+            break
 
-- If the browser opens to a login screen, sign in and rerun the script.
-- If Playwright complains about missing browser binaries, run `python -m playwright install` again.
+        # Wait for the footer position to actually change (= new page loaded).
+        changed = False
+        waited = 0
+        while waited < 12000:
+            page.wait_for_timeout(500)
+            waited += 500
+            nf = read_footer(page)
+            if nf and (prev_end is None or nf[1] != prev_end):
+                changed = True
+                break
+
+        if not changed:
+            stuck += 1
+            print(f"  Page didn't advance (stuck {stuck}/3).")
+            if stuck >= 3:
+                print("  Stopping -- pagination isn't advancing.")
+                break
+        else:
+            stuck = 0
+    save()
+
+def run():
+    with sync_playwright() as p:
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir=SESSION_DIR, headless=False,
+            args=["--disable-blink-features=AutomationControlled"])
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        page.on("response", on_response)
+
+        print("Opening candidate list... log in if prompted.")
+        page.goto(START_URL)
+        try:
+            page.wait_for_selector("tbody tr, [role='row']", timeout=60000)
+        except Exception:
+            print("Rows not detected -- log in if you see a login screen.")
+        page.wait_for_timeout(4000)
+
+        foot = read_footer(page)
+        total = foot[2] if foot else None
+        print(f"\nApplicant total (from footer): {total}")
+
+        for which in SORT_PASSES:
+            print(f"\n===== PASS: sort {which} first =====")
+            ensure_page_one(page, which)
+            page.wait_for_timeout(1500)
+            harvest_pages(page)
+            save()
+
+        print(f"\nDone. {len(candidates)} candidates -> {JSON_FILE} and {CSV_FILE}")
+        if total and len(candidates) < total * 0.9:
+            print(f"NOTE: collected {len(candidates)} of ~{total}. If both passes "
+                  "capped at 3000 and the overlap wasn't enough, tell me the numbers "
+                  "and we'll segment by another filter (location/status).")
+        browser.close()
+
+if __name__ == "__main__":
+    load_existing()
+    run()
